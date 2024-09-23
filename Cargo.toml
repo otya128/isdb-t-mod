@@ -1,0 +1,8 @@
+[package]
+name = "isdb-t-mod"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reed-solomon = "0.2.1"
+rustfft = "6.2.0"
