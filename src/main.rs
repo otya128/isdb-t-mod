@@ -1,8 +1,5 @@
 use reed_solomon::Encoder;
-use rustfft::{
-    num_complex::Complex32,
-    FftPlanner,
-};
+use rustfft::{num_complex::Complex32, FftPlanner};
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
@@ -246,6 +243,54 @@ fn encode_dbpsk(data: &[u8]) -> Vec<bool> {
 
 const OFDM_FRAME_SYMBOLS: usize = 204;
 fn main() -> io::Result<()> {
+    let tmcc = TMCC {
+        segment_type: SegmentType::Coherent,
+        system_idenfication: SystemIdentification::Television,
+        switcihg_indicator: 0b1111,
+        startup_control: false,
+        current: TransmissionParameter {
+            partial_reception: true,
+            layer_a: LayerParameter {
+                carrier_modulation: CarrierModulation::QPSK,
+                coding_rate: TMCCCodingRate::Rate2_3,
+                number_of_segments: 1,
+                time_interleaving_length: 0b11,
+            },
+            layer_b: LayerParameter {
+                carrier_modulation: CarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+            layer_c: LayerParameter {
+                carrier_modulation: CarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+        },
+        next: TransmissionParameter {
+            partial_reception: true,
+            layer_a: LayerParameter {
+                carrier_modulation: CarrierModulation::QPSK,
+                coding_rate: TMCCCodingRate::Rate2_3,
+                number_of_segments: 1,
+                time_interleaving_length: 0b11,
+            },
+            layer_b: LayerParameter {
+                carrier_modulation: CarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+            layer_c: LayerParameter {
+                carrier_modulation: CarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+        },
+    };
     let qpsk_mapping = [
         Complex32::from_polar(1.0f32, 45.0f32.to_radians()),
         Complex32::from_polar(1.0f32, 135.0f32.to_radians()),
@@ -298,7 +343,7 @@ fn main() -> io::Result<()> {
     }
     let mut ac_data = Vec::with_capacity((OFDM_FRAME_SYMBOLS + 7) / 8);
     ac_data.resize((OFDM_FRAME_SYMBOLS + 7) / 8, 0xffu8);
-    let mut tmcc_data = vec![];
+    let mut tmcc_data = Vec::from_iter(tmcc.to_bytes());
     tmcc_data.resize((OFDM_FRAME_SYMBOLS + 7) / 8, 0x00);
     let encoded_ac = encode_dbpsk(&ac_data);
     tmcc_data[0] = 0b00110101;
@@ -447,4 +492,211 @@ fn main() -> io::Result<()> {
             }
         }
     }
+}
+
+#[allow(unused)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SegmentType {
+    Coherent = 0,
+    Undefined1 = 1,
+    Undefined2 = 2,
+    Undefined3 = 3,
+    Undefined4 = 4,
+    Undefined5 = 5,
+    Undefined6 = 6,
+    Differential = 7,
+}
+
+#[allow(unused)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SystemIdentification {
+    Television = 0,
+    Sound = 1,
+    Undefined2 = 2,
+    Undefined3 = 3,
+}
+
+#[allow(unused)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum CarrierModulation {
+    DQPSK = 0,
+    QPSK = 1,
+    QAM16 = 2,
+    QAM64 = 3,
+    Undefined4 = 4,
+    Undefined5 = 5,
+    Undefined6 = 6,
+    Unused = 7,
+}
+
+#[allow(unused)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+enum CodingRate {
+    Rate1_2,
+    Rate2_3,
+    Rate3_4,
+    Rate5_6,
+    Rate7_8,
+}
+
+#[allow(unused)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+enum TMCCCodingRate {
+    Rate1_2 = 0,
+    Rate2_3 = 1,
+    Rate3_4 = 2,
+    Rate5_6 = 3,
+    Rate7_8 = 4,
+    Undefined5 = 5,
+    Undefined6 = 6,
+    Unused = 7,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayerParameter {
+    carrier_modulation: CarrierModulation,
+    coding_rate: TMCCCodingRate,
+    time_interleaving_length: u8,
+    number_of_segments: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransmissionParameter {
+    partial_reception: bool,
+    layer_a: LayerParameter,
+    layer_b: LayerParameter,
+    layer_c: LayerParameter,
+}
+
+impl TransmissionParameter {
+    fn to_bytes(&self) -> [u8; 5] {
+        let mut buf = [0u8; 5];
+        let mut pos = 0;
+        set_bits(&mut buf, pos, 1, if self.partial_reception { 1 } else { 0 });
+        pos += 1;
+        set_bits(&mut buf, pos, 3, self.layer_a.carrier_modulation as u32);
+        pos += 3;
+        set_bits(&mut buf, pos, 3, self.layer_a.coding_rate as u32);
+        pos += 3;
+        set_bits(
+            &mut buf,
+            pos,
+            3,
+            self.layer_a.time_interleaving_length as u32,
+        );
+        pos += 3;
+        set_bits(&mut buf, pos, 4, self.layer_a.number_of_segments as u32);
+        pos += 4;
+        set_bits(&mut buf, pos, 3, self.layer_b.carrier_modulation as u32);
+        pos += 3;
+        set_bits(&mut buf, pos, 3, self.layer_b.coding_rate as u32);
+        pos += 3;
+        set_bits(
+            &mut buf,
+            pos,
+            3,
+            self.layer_b.time_interleaving_length as u32,
+        );
+        pos += 3;
+        set_bits(&mut buf, pos, 4, self.layer_b.number_of_segments as u32);
+        pos += 4;
+        set_bits(&mut buf, pos, 3, self.layer_c.carrier_modulation as u32);
+        pos += 3;
+        set_bits(&mut buf, pos, 3, self.layer_c.coding_rate as u32);
+        pos += 3;
+        set_bits(
+            &mut buf,
+            pos,
+            3,
+            self.layer_c.time_interleaving_length as u32,
+        );
+        pos += 3;
+        set_bits(&mut buf, pos, 4, self.layer_c.number_of_segments as u32);
+        pos += 4;
+        assert_eq!(pos, 40);
+        return buf;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TMCC {
+    segment_type: SegmentType,
+    system_idenfication: SystemIdentification,
+    switcihg_indicator: u8,
+    startup_control: bool,
+    current: TransmissionParameter,
+    next: TransmissionParameter,
+}
+
+impl TMCC {
+    fn to_bytes(&self) -> [u8; 26] {
+        let mut buf = [0u8; 26];
+        let mut pos = 16;
+        set_bits(&mut buf, pos, 3, self.segment_type as u32);
+        pos += 3;
+        set_bits(&mut buf, pos, 2, self.system_idenfication as u32);
+        pos += 2;
+        set_bits(&mut buf, pos, 4, self.switcihg_indicator as u32);
+        pos += 4;
+        set_bits(&mut buf, pos, 1, if self.startup_control { 1 } else { 0 });
+        pos += 1;
+        for b in self.current.to_bytes() {
+            set_bits(&mut buf, pos, 8, b as u32);
+            pos += 8;
+        }
+        for b in self.next.to_bytes() {
+            set_bits(&mut buf, pos, 8, b as u32);
+            pos += 8;
+        }
+        set_bits(&mut buf, pos, 3, 0b111);
+        pos += 3;
+        set_bits(&mut buf, pos, 12, 0b111111111111);
+        pos += 12;
+        assert_eq!(pos, 121);
+        let parity = calc_272_190_parity(&buf, 19, 120);
+        set_bits(&mut buf, pos, 82 - 64, (parity >> 64) as u32);
+        pos += 82 - 64;
+        set_bits(&mut buf, pos, 32, (parity >> 32) as u32);
+        pos += 32;
+        set_bits(&mut buf, pos, 32, parity as u32);
+        pos += 32;
+        assert_eq!(pos, 203);
+        return buf;
+    }
+}
+
+fn set_bits(buf: &mut [u8], mut pos: usize, bits: usize, value: u32) {
+    for i in (0..bits).rev() {
+        let bit = ((value >> i) & 1) as u8;
+        buf[pos / 8] &= !(1 << (7 - pos % 8));
+        buf[pos / 8] |= bit << (7 - pos % 8);
+        pos += 1;
+    }
+}
+
+fn calc_272_190_parity(data: &[u8], begin: usize, end: usize) -> u128 {
+    const POLY: u128 = (1 << 77)
+        | (1 << 76)
+        | (1 << 71)
+        | (1 << 67)
+        | (1 << 66)
+        | (1 << 56)
+        | (1 << 52)
+        | (1 << 48)
+        | (1 << 40)
+        | (1 << 36)
+        | (1 << 34)
+        | (1 << 24)
+        | (1 << 22)
+        | (1 << 18)
+        | (1 << 10)
+        | (1 << 4)
+        | 1;
+    let mut d = 0u128;
+    for in_bi in begin..=end {
+        d <<= 1;
+        if (data[in_bi / 8] & (1 << (7 - in_bi % 8)) != 0) ^ ((d & (1 << 82)) != 0) {
+            d ^= POLY;
+        }
+    }
+    return d & ((1 << 82) - 1);
 }
