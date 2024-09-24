@@ -246,7 +246,7 @@ fn main() -> io::Result<()> {
         switcihg_indicator: 0b1111,
         startup_control: false,
         current: TransmissionParameter {
-            partial_reception: true,
+            partial_reception: false,
             layer_a: LayerParameter {
                 carrier_modulation: CarrierModulation::QPSK,
                 coding_rate: TMCCCodingRate::Rate2_3,
@@ -267,7 +267,7 @@ fn main() -> io::Result<()> {
             },
         },
         next: TransmissionParameter {
-            partial_reception: true,
+            partial_reception: false,
             layer_a: LayerParameter {
                 carrier_modulation: CarrierModulation::QPSK,
                 coding_rate: TMCCCodingRate::Rate2_3,
