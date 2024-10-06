@@ -3,6 +3,7 @@ use rustfft::{num_complex::Complex32, FftPlanner};
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
+    time::Instant,
 };
 
 const SEGMENTS: usize = 13;
@@ -85,7 +86,12 @@ impl TimeInterleaver {
     }
 }
 
-fn convolve(data: &[u8], mut d: u8) -> (Vec<bool>, u8) {
+fn convolve(
+    data: &[u8],
+    mut d: u8,
+    puncture_pattern: &[bool],
+    mut puncture_state: usize,
+) -> (Vec<bool>, u8, usize) {
     let mut v = Vec::with_capacity(data.len() * 2);
     const G1: u8 = 0o171;
     const G2: u8 = 0o133;
@@ -96,26 +102,51 @@ fn convolve(data: &[u8], mut d: u8) -> (Vec<bool>, u8) {
             }
             let c0 = ((d & G1).count_ones() & 1) == 1;
             let c1 = ((d & G2).count_ones() & 1) == 1;
-            v.push(c0);
-            v.push(c1);
+            if puncture_pattern[puncture_state] {
+                v.push(c0);
+            }
+            if puncture_pattern[puncture_state + 1] {
+                v.push(c1);
+            }
+            puncture_state = (puncture_state + 2) % puncture_pattern.len();
             d >>= 1;
         }
     }
-    return (v, d);
+    return (v, d, puncture_state);
 }
 
-fn puncture(data: &[bool]) -> Vec<bool> {
-    let mut v = Vec::with_capacity(data.len() * 2 / 3);
-    for c in data.chunks(4) {
-        let x1 = c[0];
-        let y1 = c[1];
-        let y2 = c[3];
-        v.push(x1);
-        v.push(y1);
-        v.push(y2);
-    }
-    return v;
-}
+const PUNCTURE_1_2: [bool; 2] = [
+    true, true, //
+];
+
+const PUNCTURE_2_3: [bool; 4] = [
+    true, true, //
+    false, true, //
+];
+
+const PUNCTURE_3_4: [bool; 6] = [
+    true, true, //
+    false, true, //
+    true, false, //
+];
+
+const PUNCTURE_5_6: [bool; 10] = [
+    true, true, //
+    false, true, //
+    true, false, //
+    false, true, //
+    true, false, //
+];
+
+const PUNCTURE_7_8: [bool; 14] = [
+    true, true, //
+    false, true, //
+    false, true, //
+    false, true, //
+    true, false, //
+    false, true, //
+    true, false, //
+];
 
 const AC_CARRIER: &[&[usize]] = &[
     &[10, 28, 161, 191, 277, 316, 335, 425],
@@ -240,6 +271,8 @@ fn encode_dbpsk(data: &[u8]) -> Vec<bool> {
 
 const OFDM_FRAME_SYMBOLS: usize = 204;
 fn main() -> io::Result<()> {
+    let modulation = CarrierModulation::QAM64;
+    let coding_rate = CodingRate::Rate3_4;
     let tmcc = TMCC {
         segment_type: SegmentType::Coherent,
         system_idenfication: SystemIdentification::Television,
@@ -248,19 +281,19 @@ fn main() -> io::Result<()> {
         current: TransmissionParameter {
             partial_reception: false,
             layer_a: LayerParameter {
-                carrier_modulation: CarrierModulation::QPSK,
-                coding_rate: TMCCCodingRate::Rate2_3,
+                carrier_modulation: TMCCCarrierModulation::from(modulation),
+                coding_rate: TMCCCodingRate::from(coding_rate),
                 number_of_segments: SEGMENTS as u8,
                 time_interleaving_length: 0b11,
             },
             layer_b: LayerParameter {
-                carrier_modulation: CarrierModulation::Unused,
+                carrier_modulation: TMCCCarrierModulation::Unused,
                 coding_rate: TMCCCodingRate::Unused,
                 number_of_segments: 0b1111,
                 time_interleaving_length: 0b111,
             },
             layer_c: LayerParameter {
-                carrier_modulation: CarrierModulation::Unused,
+                carrier_modulation: TMCCCarrierModulation::Unused,
                 coding_rate: TMCCCodingRate::Unused,
                 number_of_segments: 0b1111,
                 time_interleaving_length: 0b111,
@@ -269,19 +302,19 @@ fn main() -> io::Result<()> {
         next: TransmissionParameter {
             partial_reception: false,
             layer_a: LayerParameter {
-                carrier_modulation: CarrierModulation::QPSK,
-                coding_rate: TMCCCodingRate::Rate2_3,
+                carrier_modulation: TMCCCarrierModulation::from(modulation),
+                coding_rate: TMCCCodingRate::from(coding_rate),
                 number_of_segments: SEGMENTS as u8,
                 time_interleaving_length: 0b11,
             },
             layer_b: LayerParameter {
-                carrier_modulation: CarrierModulation::Unused,
+                carrier_modulation: TMCCCarrierModulation::Unused,
                 coding_rate: TMCCCodingRate::Unused,
                 number_of_segments: 0b1111,
                 time_interleaving_length: 0b111,
             },
             layer_c: LayerParameter {
-                carrier_modulation: CarrierModulation::Unused,
+                carrier_modulation: TMCCCarrierModulation::Unused,
                 coding_rate: TMCCCodingRate::Unused,
                 number_of_segments: 0b1111,
                 time_interleaving_length: 0b111,
@@ -307,8 +340,33 @@ fn main() -> io::Result<()> {
     let symbol_len = 2048 * (1 << (mode as usize - 1));
     let guard_interval_len = symbol_len / guard_interval_ratio;
     let segments = SEGMENTS;
-    let mut bit_delay = VecDeque::from_iter(std::iter::repeat(false).take(1536 * segments - 240));
-    let mut qpsk_delay = VecDeque::from_iter(std::iter::repeat(false).take(120));
+    let mod_bits = match modulation {
+        CarrierModulation::DQPSK | CarrierModulation::QPSK => 2,
+        CarrierModulation::QAM16 => 4,
+        CarrierModulation::QAM64 => 6,
+    };
+    let mut bit_delay = VecDeque::from_iter(
+        std::iter::repeat(false)
+            .take((192 * (1 << (mode as usize - 1)) * segments - 120) * mod_bits),
+    );
+    let mut qpsk_delay = [
+        VecDeque::from_iter(std::iter::repeat(false).take(0)),
+        VecDeque::from_iter(std::iter::repeat(false).take(120)),
+    ];
+    let mut qam16_delay = [
+        VecDeque::from_iter(std::iter::repeat(false).take(0)),
+        VecDeque::from_iter(std::iter::repeat(false).take(40)),
+        VecDeque::from_iter(std::iter::repeat(false).take(80)),
+        VecDeque::from_iter(std::iter::repeat(false).take(120)),
+    ];
+    let mut qam64_delay = [
+        VecDeque::from_iter(std::iter::repeat(false).take(0)),
+        VecDeque::from_iter(std::iter::repeat(false).take(24)),
+        VecDeque::from_iter(std::iter::repeat(false).take(48)),
+        VecDeque::from_iter(std::iter::repeat(false).take(72)),
+        VecDeque::from_iter(std::iter::repeat(false).take(96)),
+        VecDeque::from_iter(std::iter::repeat(false).take(120)),
+    ];
     let time_interleave_length = 4;
     let mut time_interleavers = Vec::with_capacity(segments);
     time_interleavers.resize_with(segments, || {
@@ -325,7 +383,9 @@ fn main() -> io::Result<()> {
     let rs_encoder = Encoder::new(TS_PARITY_SIZE);
     let mut ofdm_symbol_index = OFDM_FRAME_SYMBOLS - 2;
     let mut ofdm_frame_index = 0;
-    let delay = 64 * segments - 11;
+    let delay = 12 * mod_bits * (1 << (mode as usize - 1)) * segments * coding_rate.numer()
+        / coding_rate.denom()
+        - 11;
     let mut tsp_delay = VecDeque::new();
     for _ in 0..delay {
         let mut tsp = Vec::with_capacity(TSP_SIZE);
@@ -352,7 +412,21 @@ fn main() -> io::Result<()> {
         pilot_prbs_state = pilot_prbs(pilot_prbs_state);
     }
     let mut convolutional_encoder_state = 0;
-    (_, convolutional_encoder_state) = convolve(&[TS_SYNC_BYTE], convolutional_encoder_state);
+    (_, convolutional_encoder_state, _) = convolve(
+        &[TS_SYNC_BYTE],
+        convolutional_encoder_state,
+        &PUNCTURE_1_2,
+        0,
+    );
+    let mut puncture_state = 0;
+    let puncture_pattern = match coding_rate {
+        CodingRate::Rate1_2 => &PUNCTURE_1_2[..],
+        CodingRate::Rate2_3 => &PUNCTURE_2_3[..],
+        CodingRate::Rate3_4 => &PUNCTURE_3_4[..],
+        CodingRate::Rate5_6 => &PUNCTURE_5_6[..],
+        CodingRate::Rate7_8 => &PUNCTURE_7_8[..],
+    };
+    let mut bit_buf = Vec::new();
     let mut prbs_state = BYTE_PRBS_INITIAL_STATE;
     let mut layer_carriers = Vec::new();
     let mut time_interleaved_layer_carriers =
@@ -369,6 +443,7 @@ fn main() -> io::Result<()> {
     let mut randomized_layer_carriers = Vec::with_capacity(segments * number_of_data_carriers);
     randomized_layer_carriers.resize(segments * number_of_data_carriers, Complex32::ZERO);
     let mut packet = [0u8; TS_SIZE];
+    let mut frame_begin_time = Instant::now();
     loop {
         stdin.read_exact(&mut packet)?;
         let encoded_packet = rs_encoder.encode(&packet);
@@ -386,23 +461,95 @@ fn main() -> io::Result<()> {
             ibuf.push(byte_interleaver.push(b));
         }
         let convolved;
-        (convolved, convolutional_encoder_state) = convolve(&ibuf, convolutional_encoder_state);
-        let mut bit_buf = Vec::new();
-        for b in puncture(&convolved) {
+        (convolved, convolutional_encoder_state, puncture_state) = convolve(
+            &ibuf,
+            convolutional_encoder_state,
+            puncture_pattern,
+            puncture_state,
+        );
+        for b in convolved {
             bit_delay.push_back(b);
             bit_buf.push(bit_delay.pop_front().unwrap());
         }
-        for c in bit_buf.chunks(2) {
-            let b0 = c[0];
-            let b1 = c[1];
-            qpsk_delay.push_back(b1);
-            let b1 = qpsk_delay.pop_front().unwrap();
-            let symbol = qpsk_mapping[match (b0, b1) {
-                (false, false) => 0,
-                (true, false) => 1,
-                (true, true) => 2,
-                (false, true) => 3,
-            }];
+        let mut chunks = bit_buf.chunks_exact(mod_bits);
+        while let Some(c) = chunks.next() {
+            let symbol = match modulation {
+                CarrierModulation::DQPSK => {
+                    panic!("unsupported");
+                }
+                CarrierModulation::QPSK => {
+                    qpsk_delay[0].push_back(c[0]);
+                    qpsk_delay[1].push_back(c[1]);
+                    let b0 = qpsk_delay[0].pop_front().unwrap();
+                    let b1 = qpsk_delay[1].pop_front().unwrap();
+                    qpsk_mapping[match (b0, b1) {
+                        (false, false) => 0,
+                        (true, false) => 1,
+                        (true, true) => 2,
+                        (false, true) => 3,
+                    }]
+                }
+                CarrierModulation::QAM16 => {
+                    qam16_delay[0].push_back(c[0]);
+                    qam16_delay[1].push_back(c[1]);
+                    qam16_delay[2].push_back(c[2]);
+                    qam16_delay[3].push_back(c[3]);
+                    let b0 = qam16_delay[0].pop_front().unwrap();
+                    let b1 = qam16_delay[1].pop_front().unwrap();
+                    let b2 = qam16_delay[2].pop_front().unwrap();
+                    let b3 = qam16_delay[3].pop_front().unwrap();
+                    Complex32::new(
+                        match (b0, b2) {
+                            (true, false) => -3,
+                            (true, true) => -1,
+                            (false, true) => 1,
+                            (false, false) => 3,
+                        } as f32,
+                        match (b1, b3) {
+                            (true, false) => -3,
+                            (true, true) => -1,
+                            (false, true) => 1,
+                            (false, false) => 3,
+                        } as f32,
+                    ) / 10f32.sqrt()
+                }
+                CarrierModulation::QAM64 => {
+                    qam64_delay[0].push_back(c[0]);
+                    qam64_delay[1].push_back(c[1]);
+                    qam64_delay[2].push_back(c[2]);
+                    qam64_delay[3].push_back(c[3]);
+                    qam64_delay[4].push_back(c[4]);
+                    qam64_delay[5].push_back(c[5]);
+                    let b0 = qam64_delay[0].pop_front().unwrap();
+                    let b1 = qam64_delay[1].pop_front().unwrap();
+                    let b2 = qam64_delay[2].pop_front().unwrap();
+                    let b3 = qam64_delay[3].pop_front().unwrap();
+                    let b4 = qam64_delay[4].pop_front().unwrap();
+                    let b5 = qam64_delay[5].pop_front().unwrap();
+                    Complex32::new(
+                        match (b0, b2, b4) {
+                            (true, false, false) => -7,
+                            (true, false, true) => -5,
+                            (true, true, true) => -3,
+                            (true, true, false) => -1,
+                            (false, true, false) => 1,
+                            (false, true, true) => 3,
+                            (false, false, true) => 5,
+                            (false, false, false) => 7,
+                        } as f32,
+                        match (b1, b3, b5) {
+                            (true, false, false) => -7,
+                            (true, false, true) => -5,
+                            (true, true, true) => -3,
+                            (true, true, false) => -1,
+                            (false, true, false) => 1,
+                            (false, true, true) => 3,
+                            (false, false, true) => 5,
+                            (false, false, false) => 7,
+                        } as f32,
+                    ) / 42f32.sqrt()
+                }
+            };
             layer_carriers.push(symbol);
             if layer_carriers.len() == number_of_data_carriers * segments {
                 for segment in 0..segments {
@@ -506,29 +653,48 @@ fn main() -> io::Result<()> {
                 let guard_interval = &carriers[carriers.len() - guard_interval_len..];
                 if ofdm_frame_index > 2 {
                     let mut buf = Vec::new();
+                    let scale = 1f32;
                     for c in guard_interval {
-                        let c = c / 8192f32.sqrt();
-                        buf.extend_from_slice(&c.re.to_le_bytes());
-                        buf.extend_from_slice(&c.im.to_le_bytes());
+                        let s = (c.re * scale) as i32;
+                        buf.extend_from_slice(&(s as u16).to_le_bytes());
+                        let s = (c.im * scale) as i32;
+                        buf.extend_from_slice(&(s as u16).to_le_bytes());
+                        // buf.extend_from_slice(&c.re.to_le_bytes());
+                        // buf.extend_from_slice(&c.im.to_le_bytes());
                     }
                     for c in &carriers {
-                        let c = c / 8192f32.sqrt();
-                        buf.extend_from_slice(&c.re.to_le_bytes());
-                        buf.extend_from_slice(&c.im.to_le_bytes());
+                        let s = (c.re * scale) as i32;
+                        buf.extend_from_slice(&(s as u16).to_le_bytes());
+                        let s = (c.im * scale) as i32;
+                        buf.extend_from_slice(&(s as u16).to_le_bytes());
+                        // buf.extend_from_slice(&c.re.to_le_bytes());
+                        // buf.extend_from_slice(&c.im.to_le_bytes());
                     }
                     output.write(&buf)?;
                 }
                 ofdm_symbol_index += 1;
                 if ofdm_symbol_index == OFDM_FRAME_SYMBOLS - 2 {
                     prbs_state = BYTE_PRBS_INITIAL_STATE;
+                    puncture_state = 0;
                 }
                 if ofdm_symbol_index == OFDM_FRAME_SYMBOLS {
                     ofdm_symbol_index = 0;
-                    eprintln!("{ofdm_frame_index}");
+                    eprintln!(
+                        "{ofdm_frame_index} {:.03}",
+                        (Instant::now() - frame_begin_time).as_secs_f32()
+                    );
+                    frame_begin_time = Instant::now();
                     ofdm_frame_index += 1;
                 }
                 layer_carriers.clear();
             }
+        }
+        if !chunks.remainder().is_empty() {
+            let remainder = chunks.remainder().to_vec();
+            bit_buf.clear();
+            bit_buf.extend_from_slice(&remainder);
+        } else {
+            bit_buf.clear();
         }
     }
 }
@@ -558,6 +724,15 @@ enum SystemIdentification {
 #[allow(unused)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum CarrierModulation {
+    DQPSK,
+    QPSK,
+    QAM16,
+    QAM64,
+}
+
+#[allow(unused)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum TMCCCarrierModulation {
     DQPSK = 0,
     QPSK = 1,
     QAM16 = 2,
@@ -568,6 +743,17 @@ enum CarrierModulation {
     Unused = 7,
 }
 
+impl From<CarrierModulation> for TMCCCarrierModulation {
+    fn from(value: CarrierModulation) -> Self {
+        return match value {
+            CarrierModulation::DQPSK => TMCCCarrierModulation::DQPSK,
+            CarrierModulation::QPSK => TMCCCarrierModulation::QPSK,
+            CarrierModulation::QAM16 => TMCCCarrierModulation::QAM16,
+            CarrierModulation::QAM64 => TMCCCarrierModulation::QAM64,
+        };
+    }
+}
+
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 enum CodingRate {
@@ -576,6 +762,27 @@ enum CodingRate {
     Rate3_4,
     Rate5_6,
     Rate7_8,
+}
+
+impl CodingRate {
+    pub fn numer(&self) -> usize {
+        return match self {
+            CodingRate::Rate1_2 => 1,
+            CodingRate::Rate2_3 => 2,
+            CodingRate::Rate3_4 => 3,
+            CodingRate::Rate5_6 => 5,
+            CodingRate::Rate7_8 => 7,
+        };
+    }
+    pub fn denom(&self) -> usize {
+        return match self {
+            CodingRate::Rate1_2 => 2,
+            CodingRate::Rate2_3 => 3,
+            CodingRate::Rate3_4 => 4,
+            CodingRate::Rate5_6 => 6,
+            CodingRate::Rate7_8 => 8,
+        };
+    }
 }
 
 #[allow(unused)]
@@ -590,9 +797,22 @@ enum TMCCCodingRate {
     Undefined6 = 6,
     Unused = 7,
 }
+
+impl From<CodingRate> for TMCCCodingRate {
+    fn from(value: CodingRate) -> Self {
+        return match value {
+            CodingRate::Rate1_2 => TMCCCodingRate::Rate1_2,
+            CodingRate::Rate2_3 => TMCCCodingRate::Rate2_3,
+            CodingRate::Rate3_4 => TMCCCodingRate::Rate3_4,
+            CodingRate::Rate5_6 => TMCCCodingRate::Rate5_6,
+            CodingRate::Rate7_8 => TMCCCodingRate::Rate7_8,
+        };
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LayerParameter {
-    carrier_modulation: CarrierModulation,
+    carrier_modulation: TMCCCarrierModulation,
     coding_rate: TMCCCodingRate,
     time_interleaving_length: u8,
     number_of_segments: u8,
