@@ -494,7 +494,154 @@ fn tsp_to_symbols_worker(
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Layer {
+    A,
+    B,
+    C,
+}
+
+fn simulate_model_receiver(
+    params: Parameters,
+    layer_a: LayerParameters,
+    layer_b: LayerParameters,
+    layer_c: LayerParameters,
+) -> Vec<Option<Layer>> {
+    let number_of_data_carriers = 96 * (1 << (params.mode as usize - 1));
+    let symbol_len = 2048 * (1 << (params.mode as usize - 1));
+    let guard_interval_len = symbol_len / params.guard_interval_ratio;
+    let depunctured_tsp_bits = TSP_SIZE * 2 * 8;
+    let tsp_read_interval = TSP_SIZE * 2;
+    let mut ts_buffer = VecDeque::new();
+    let mut clock = 0;
+    let mut layer_a_buffer_bits = 0;
+    let mut layer_b_buffer_bits = 0;
+    let mut layer_c_buffer_bits = 0;
+    let mut layer_a_depuncture_pos = 0;
+    let mut layer_b_depuncture_pos = 0;
+    let mut layer_c_depuncture_pos = 0;
+    let mut ts_pattern = Vec::new();
+    let tsp_delay = 3;
+    for _ in 0..204 / (1 << (params.mode as usize - 1)) {
+        for _ in 0..number_of_data_carriers * layer_a.segments {
+            // layer_a_buffer_bits += 2
+            //     * (((k + 1) * layer_a.modulation.get_bits() * layer_a.coding_rate.numer()
+            //         / layer_a.coding_rate.denom())
+            //         - (k * layer_a.modulation.get_bits() * layer_a.coding_rate.numer()
+            //             / layer_a.coding_rate.denom()));
+            for _ in 0..layer_a.modulation.get_bits() {
+                layer_a_buffer_bits += 1;
+                if layer_a_depuncture_pos >= 2 {
+                    layer_a_buffer_bits += 1;
+                }
+                layer_a_depuncture_pos = (layer_a_depuncture_pos + 1) % layer_a.coding_rate.denom();
+                if layer_a_buffer_bits >= depunctured_tsp_bits {
+                    layer_a_buffer_bits -= depunctured_tsp_bits;
+                    ts_buffer.push_back(Layer::A);
+                }
+            }
+            if (clock % tsp_read_interval) == 0 {
+                if clock >= tsp_read_interval * tsp_delay {
+                    ts_pattern.push(ts_buffer.pop_front());
+                }
+            }
+            clock += 1;
+        }
+        for _ in 0..number_of_data_carriers * layer_b.segments {
+            // layer_b_buffer_bits += 2
+            //     * (((k + 1) * layer_b.modulation.get_bits() * layer_b.coding_rate.numer()
+            //         / layer_b.coding_rate.denom())
+            //         - (k * layer_b.modulation.get_bits() * layer_b.coding_rate.numer()
+            //             / layer_b.coding_rate.denom()));
+            for _ in 0..layer_b.modulation.get_bits() {
+                layer_b_buffer_bits += 1;
+                if layer_b_depuncture_pos >= 2 {
+                    layer_b_buffer_bits += 1;
+                }
+                layer_b_depuncture_pos = (layer_b_depuncture_pos + 1) % layer_b.coding_rate.denom();
+                if layer_b_buffer_bits >= depunctured_tsp_bits {
+                    layer_b_buffer_bits -= depunctured_tsp_bits;
+                    ts_buffer.push_back(Layer::B);
+                }
+            }
+            if (clock % tsp_read_interval) == 0 {
+                if clock >= tsp_read_interval * tsp_delay {
+                    ts_pattern.push(ts_buffer.pop_front());
+                }
+            }
+            clock += 1;
+        }
+        for _ in 0..number_of_data_carriers * layer_c.segments {
+            // layer_c_buffer_bits += 2
+            //     * (((k + 1) * layer_c.modulation.get_bits() * layer_c.coding_rate.numer()
+            //         / layer_c.coding_rate.denom())
+            //         - (k * layer_c.modulation.get_bits() * layer_c.coding_rate.numer()
+            //             / layer_c.coding_rate.denom()));
+            for _ in 0..layer_c.modulation.get_bits() {
+                layer_c_buffer_bits += 1;
+                if layer_c_depuncture_pos >= 2 {
+                    layer_c_buffer_bits += 1;
+                }
+                layer_c_depuncture_pos = (layer_c_depuncture_pos + 1) % layer_c.coding_rate.denom();
+                if layer_c_buffer_bits >= depunctured_tsp_bits {
+                    layer_c_buffer_bits -= depunctured_tsp_bits;
+                    ts_buffer.push_back(Layer::C);
+                }
+            }
+            if (clock % tsp_read_interval) == 0 {
+                if clock >= tsp_read_interval * tsp_delay {
+                    ts_pattern.push(ts_buffer.pop_front());
+                }
+            }
+            clock += 1;
+        }
+        for _ in number_of_data_carriers * SEGMENTS..symbol_len + guard_interval_len {
+            if (clock % tsp_read_interval) == 0 {
+                if clock >= tsp_read_interval * tsp_delay {
+                    ts_pattern.push(ts_buffer.pop_front());
+                }
+            }
+            clock += 1;
+        }
+    }
+    for _ in 0..tsp_delay {
+        ts_pattern.push(ts_buffer.pop_front());
+    }
+    assert_eq!(layer_a_buffer_bits, 0);
+    assert_eq!(layer_b_buffer_bits, 0);
+    assert_eq!(layer_c_buffer_bits, 0);
+    assert_eq!(ts_buffer.len(), 0);
+    for _ in 1..params.mode as usize {
+        ts_pattern.extend_from_within(..);
+    }
+    return ts_pattern;
+}
+
 fn main() -> io::Result<()> {
+    let _ = simulate_model_receiver(
+        Parameters {
+            mode: Mode::Mode3,
+            guard_interval_ratio: 8,
+        },
+        LayerParameters {
+            modulation: CarrierModulation::QPSK,
+            segments: 1,
+            coding_rate: CodingRate::Rate2_3,
+            time_interleave_length: 4,
+        },
+        LayerParameters {
+            modulation: CarrierModulation::QAM64,
+            segments: 12,
+            coding_rate: CodingRate::Rate3_4,
+            time_interleave_length: 2,
+        },
+        LayerParameters {
+            modulation: CarrierModulation::QAM64,
+            segments: 0,
+            coding_rate: CodingRate::Rate7_8,
+            time_interleave_length: 4,
+        },
+    );
     let mode = Mode::Mode3;
     let guard_interval_ratio = 8;
     let params = LayerParameters {
