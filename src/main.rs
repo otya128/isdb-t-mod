@@ -270,84 +270,88 @@ fn encode_dbpsk(data: &[u8]) -> Vec<bool> {
 }
 
 const OFDM_FRAME_SYMBOLS: usize = 204;
-fn main() -> io::Result<()> {
-    let modulation = CarrierModulation::QAM64;
-    let coding_rate = CodingRate::Rate3_4;
-    let tmcc = TMCC {
-        segment_type: SegmentType::Coherent,
-        system_idenfication: SystemIdentification::Television,
-        switcihg_indicator: 0b1111,
-        startup_control: false,
-        current: TransmissionParameter {
-            partial_reception: false,
-            layer_a: LayerParameter {
-                carrier_modulation: TMCCCarrierModulation::from(modulation),
-                coding_rate: TMCCCodingRate::from(coding_rate),
-                number_of_segments: SEGMENTS as u8,
-                time_interleaving_length: 0b11,
-            },
-            layer_b: LayerParameter {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
-            layer_c: LayerParameter {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
-        },
-        next: TransmissionParameter {
-            partial_reception: false,
-            layer_a: LayerParameter {
-                carrier_modulation: TMCCCarrierModulation::from(modulation),
-                coding_rate: TMCCCodingRate::from(coding_rate),
-                number_of_segments: SEGMENTS as u8,
-                time_interleaving_length: 0b11,
-            },
-            layer_b: LayerParameter {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
-            layer_c: LayerParameter {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
-        },
-    };
+
+#[derive(Clone)]
+struct Parameters {
+    mode: Mode,
+    guard_interval_ratio: usize,
+}
+
+#[derive(Clone)]
+struct LayerParameters {
+    modulation: CarrierModulation,
+    segments: usize,
+    coding_rate: CodingRate,
+    time_interleave_length: usize,
+}
+
+fn tsp_worker(
+    trans_params: Parameters,
+    params: LayerParameters,
+    sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+) {
+    let mod_bits = params.modulation.get_bits();
+    let mode = trans_params.mode;
+    let mut stdin = std::io::stdin();
+    let rs_encoder = Encoder::new(TS_PARITY_SIZE);
+    let tsp_per_frame =
+        12 * mod_bits * (1 << (mode as usize - 1)) * params.segments * params.coding_rate.numer()
+            / params.coding_rate.denom();
+    let delay = tsp_per_frame - 11;
+    let mut tsp_delay = VecDeque::new();
+    for _ in 0..delay {
+        let mut tsp = Vec::with_capacity(TSP_SIZE);
+        let null_tsp = rs_encoder.encode(&NULL_PACKET);
+        tsp.extend_from_slice(&null_tsp[1..]);
+        tsp.push(TS_SYNC_BYTE);
+        tsp_delay.push_back(tsp);
+    }
+    let mut packet = [0u8; TS_SIZE];
+    let mut byte_interleaver = ByteInterleaver::new();
+    let mut prbs_state = BYTE_PRBS_INITIAL_STATE;
+    let mut tsp_count = 0;
+    loop {
+        stdin.read_exact(&mut packet).unwrap();
+        let encoded_packet = rs_encoder.encode(&packet);
+        let mut tsp = Vec::with_capacity(TSP_SIZE);
+        tsp.extend_from_slice(&encoded_packet[1..]);
+        for b in &mut tsp {
+            *b ^= next_byte_prbs(&mut prbs_state);
+        }
+        tsp.push(TS_SYNC_BYTE);
+        next_byte_prbs(&mut prbs_state);
+        tsp_delay.push_back(tsp);
+        let delayed_tsp = tsp_delay.pop_front().unwrap();
+        let mut ibuf = Vec::new();
+        for b in delayed_tsp {
+            ibuf.push(byte_interleaver.push(b));
+        }
+        sender.send(ibuf).unwrap();
+        tsp_count += 1;
+        if tsp_count >= tsp_per_frame {
+            tsp_count = 0;
+            prbs_state = BYTE_PRBS_INITIAL_STATE;
+        }
+    }
+}
+
+fn tsp_to_symbols_worker(
+    trans_params: Parameters,
+    params: LayerParameters,
+    recv: std::sync::mpsc::Receiver<Vec<u8>>,
+    sender: std::sync::mpsc::SyncSender<Vec<Complex32>>,
+) {
+    let mode = trans_params.mode;
     let qpsk_mapping = [
         Complex32::from_polar(1.0f32, 45.0f32.to_radians()),
         Complex32::from_polar(1.0f32, 135.0f32.to_radians()),
         Complex32::from_polar(1.0f32, 225.0f32.to_radians()),
         Complex32::from_polar(1.0f32, 315.0f32.to_radians()),
     ];
-    let args: Vec<_> = std::env::args().collect();
-    let mut output = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(args[1].to_string())?;
-    let mut stdin = std::io::stdin();
-    let mode = Mode::Mode3;
-    let number_of_data_carriers = 96 * (1 << (mode as usize - 1));
-    let number_of_carriers = 108 * (1 << (mode as usize - 1));
-    let guard_interval_ratio = 8;
-    let symbol_len = 2048 * (1 << (mode as usize - 1));
-    let guard_interval_len = symbol_len / guard_interval_ratio;
-    let segments = SEGMENTS;
-    let mod_bits = match modulation {
-        CarrierModulation::DQPSK | CarrierModulation::QPSK => 2,
-        CarrierModulation::QAM16 => 4,
-        CarrierModulation::QAM64 => 6,
-    };
+    let mod_bits = params.modulation.get_bits();
     let mut bit_delay = VecDeque::from_iter(
         std::iter::repeat(false)
-            .take((192 * (1 << (mode as usize - 1)) * segments - 120) * mod_bits),
+            .take((192 * (1 << (mode as usize - 1)) * params.segments - 120) * mod_bits),
     );
     let mut qpsk_delay = [
         VecDeque::from_iter(std::iter::repeat(false).take(0)),
@@ -367,50 +371,6 @@ fn main() -> io::Result<()> {
         VecDeque::from_iter(std::iter::repeat(false).take(96)),
         VecDeque::from_iter(std::iter::repeat(false).take(120)),
     ];
-    let time_interleave_length = 4;
-    let mut time_interleavers = Vec::with_capacity(segments);
-    time_interleavers.resize_with(segments, || {
-        TimeInterleaver::new(
-            time_interleave_length,
-            number_of_data_carriers,
-            match mode {
-                Mode::Mode1 | Mode::Mode2 => 7 * time_interleave_length,
-                Mode::Mode3 => 204 - (95 * time_interleave_length) % 204,
-            },
-        )
-    });
-    let mut byte_interleaver = ByteInterleaver::new();
-    let rs_encoder = Encoder::new(TS_PARITY_SIZE);
-    let mut ofdm_symbol_index = OFDM_FRAME_SYMBOLS - 2;
-    let mut ofdm_frame_index = 0;
-    let delay = 12 * mod_bits * (1 << (mode as usize - 1)) * segments * coding_rate.numer()
-        / coding_rate.denom()
-        - 11;
-    let mut tsp_delay = VecDeque::new();
-    for _ in 0..delay {
-        let mut tsp = Vec::with_capacity(TSP_SIZE);
-        let null_tsp = rs_encoder.encode(&NULL_PACKET);
-        tsp.extend_from_slice(&null_tsp[1..]);
-        tsp.push(TS_SYNC_BYTE);
-        tsp_delay.push_back(tsp);
-    }
-    let mut ac_data = Vec::with_capacity((OFDM_FRAME_SYMBOLS + 7) / 8);
-    ac_data.resize((OFDM_FRAME_SYMBOLS + 7) / 8, 0xffu8);
-    let mut tmcc_data = Vec::from_iter(tmcc.to_bytes());
-    tmcc_data.resize((OFDM_FRAME_SYMBOLS + 7) / 8, 0x00);
-    let encoded_ac = encode_dbpsk(&ac_data);
-    tmcc_data[0] = 0b00110101;
-    tmcc_data[1] = 0b11101110;
-    let encoded_tmcc_even = encode_dbpsk(&tmcc_data);
-    tmcc_data[0] = 0b11001010;
-    tmcc_data[1] = 0b00010001;
-    let encoded_tmcc_odd = encode_dbpsk(&tmcc_data);
-    let mut prbs_table = Vec::<bool>::new();
-    let mut pilot_prbs_state = PILOT_PRBS_INITIAL_STATE;
-    for _ in 0..number_of_carriers * SEGMENTS + 1 {
-        prbs_table.push((pilot_prbs_state & 1) == 1);
-        pilot_prbs_state = pilot_prbs(pilot_prbs_state);
-    }
     let mut convolutional_encoder_state = 0;
     (_, convolutional_encoder_state, _) = convolve(
         &[TS_SYNC_BYTE],
@@ -419,7 +379,7 @@ fn main() -> io::Result<()> {
         0,
     );
     let mut puncture_state = 0;
-    let puncture_pattern = match coding_rate {
+    let puncture_pattern = match params.coding_rate {
         CodingRate::Rate1_2 => &PUNCTURE_1_2[..],
         CodingRate::Rate2_3 => &PUNCTURE_2_3[..],
         CodingRate::Rate3_4 => &PUNCTURE_3_4[..],
@@ -427,39 +387,8 @@ fn main() -> io::Result<()> {
         CodingRate::Rate7_8 => &PUNCTURE_7_8[..],
     };
     let mut bit_buf = Vec::new();
-    let mut prbs_state = BYTE_PRBS_INITIAL_STATE;
     let mut layer_carriers = Vec::new();
-    let mut time_interleaved_layer_carriers =
-        Vec::with_capacity(segments * number_of_data_carriers);
-    time_interleaved_layer_carriers.resize(segments * number_of_data_carriers, Complex32::ZERO);
-    let mut inter_segment_interleaved_layer_carriers =
-        Vec::with_capacity(segments * number_of_data_carriers);
-    inter_segment_interleaved_layer_carriers
-        .resize(segments * number_of_data_carriers, Complex32::ZERO);
-    let mut intra_segment_interleaved_layer_carriers =
-        Vec::with_capacity(segments * number_of_data_carriers);
-    intra_segment_interleaved_layer_carriers
-        .resize(segments * number_of_data_carriers, Complex32::ZERO);
-    let mut randomized_layer_carriers = Vec::with_capacity(segments * number_of_data_carriers);
-    randomized_layer_carriers.resize(segments * number_of_data_carriers, Complex32::ZERO);
-    let mut packet = [0u8; TS_SIZE];
-    let mut frame_begin_time = Instant::now();
-    loop {
-        stdin.read_exact(&mut packet)?;
-        let encoded_packet = rs_encoder.encode(&packet);
-        let mut tsp = Vec::with_capacity(TSP_SIZE);
-        tsp.extend_from_slice(&encoded_packet[1..]);
-        for b in &mut tsp {
-            *b ^= next_byte_prbs(&mut prbs_state);
-        }
-        tsp.push(TS_SYNC_BYTE);
-        next_byte_prbs(&mut prbs_state);
-        tsp_delay.push_back(tsp);
-        let delayed_tsp = tsp_delay.pop_front().unwrap();
-        let mut ibuf = Vec::new();
-        for b in delayed_tsp {
-            ibuf.push(byte_interleaver.push(b));
-        }
+    while let Ok(ibuf) = recv.recv() {
         let convolved;
         (convolved, convolutional_encoder_state, puncture_state) = convolve(
             &ibuf,
@@ -473,7 +402,7 @@ fn main() -> io::Result<()> {
         }
         let mut chunks = bit_buf.chunks_exact(mod_bits);
         while let Some(c) = chunks.next() {
-            let symbol = match modulation {
+            let symbol = match params.modulation {
                 CarrierModulation::DQPSK => {
                     panic!("unsupported");
                 }
@@ -551,8 +480,174 @@ fn main() -> io::Result<()> {
                 }
             };
             layer_carriers.push(symbol);
-            if layer_carriers.len() == number_of_data_carriers * segments {
-                for segment in 0..segments {
+        }
+        let size = layer_carriers.len();
+        sender.send(layer_carriers).unwrap();
+        layer_carriers = Vec::with_capacity(size);
+        if !chunks.remainder().is_empty() {
+            let remainder = chunks.remainder().to_vec();
+            bit_buf.clear();
+            bit_buf.extend_from_slice(&remainder);
+        } else {
+            bit_buf.clear();
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    let mode = Mode::Mode3;
+    let guard_interval_ratio = 8;
+    let params = LayerParameters {
+        modulation: CarrierModulation::QAM64,
+        segments: SEGMENTS,
+        coding_rate: CodingRate::Rate3_4,
+        time_interleave_length: 4,
+    };
+    let tmcc = TMCC {
+        segment_type: SegmentType::Coherent,
+        system_idenfication: SystemIdentification::Television,
+        switcihg_indicator: 0b1111,
+        startup_control: false,
+        current: TMCCTransmissionParameters {
+            partial_reception: false,
+            layer_a: TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::from(params.modulation),
+                coding_rate: TMCCCodingRate::from(params.coding_rate),
+                number_of_segments: params.segments as u8,
+                time_interleaving_length: 0b11,
+            },
+            layer_b: TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+            layer_c: TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+        },
+        next: TMCCTransmissionParameters {
+            partial_reception: false,
+            layer_a: TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::from(params.modulation),
+                coding_rate: TMCCCodingRate::from(params.coding_rate),
+                number_of_segments: params.segments as u8,
+                time_interleaving_length: 0b11,
+            },
+            layer_b: TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+            layer_c: TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            },
+        },
+    };
+    let args: Vec<_> = std::env::args().collect();
+    let name = args[1].to_string();
+    let mut output: Box<dyn Write> = if name == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(name)?,
+        )
+    };
+    let number_of_data_carriers = 96 * (1 << (mode as usize - 1));
+    let number_of_carriers = 108 * (1 << (mode as usize - 1));
+    let symbol_len = 2048 * (1 << (mode as usize - 1));
+    let guard_interval_len = symbol_len / guard_interval_ratio;
+    let mut time_interleavers = Vec::with_capacity(params.segments);
+    time_interleavers.resize_with(params.segments, || {
+        TimeInterleaver::new(
+            params.time_interleave_length,
+            number_of_data_carriers,
+            match mode {
+                Mode::Mode1 | Mode::Mode2 => 7 * params.time_interleave_length,
+                Mode::Mode3 => {
+                    OFDM_FRAME_SYMBOLS - (95 * params.time_interleave_length) % OFDM_FRAME_SYMBOLS
+                }
+            },
+        )
+    });
+    let mut ofdm_symbol_index = OFDM_FRAME_SYMBOLS - 2;
+    let mut ofdm_frame_index = 0;
+    let mut ac_data = Vec::with_capacity((OFDM_FRAME_SYMBOLS + 7) / 8);
+    ac_data.resize((OFDM_FRAME_SYMBOLS + 7) / 8, 0xffu8);
+    let mut tmcc_data = Vec::from_iter(tmcc.to_bytes());
+    tmcc_data.resize((OFDM_FRAME_SYMBOLS + 7) / 8, 0x00);
+    let encoded_ac = encode_dbpsk(&ac_data);
+    tmcc_data[0] = 0b00110101;
+    tmcc_data[1] = 0b11101110;
+    let encoded_tmcc_even = encode_dbpsk(&tmcc_data);
+    tmcc_data[0] = 0b11001010;
+    tmcc_data[1] = 0b00010001;
+    let encoded_tmcc_odd = encode_dbpsk(&tmcc_data);
+    let mut prbs_table = Vec::<bool>::new();
+    let mut pilot_prbs_state = PILOT_PRBS_INITIAL_STATE;
+    for _ in 0..number_of_carriers * SEGMENTS + 1 {
+        prbs_table.push((pilot_prbs_state & 1) == 1);
+        pilot_prbs_state = pilot_prbs(pilot_prbs_state);
+    }
+    let mut layer_carriers = Vec::new();
+    let mut time_interleaved_layer_carriers =
+        Vec::with_capacity(params.segments * number_of_data_carriers);
+    time_interleaved_layer_carriers
+        .resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+    let mut inter_segment_interleaved_layer_carriers =
+        Vec::with_capacity(params.segments * number_of_data_carriers);
+    inter_segment_interleaved_layer_carriers
+        .resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+    let mut intra_segment_interleaved_layer_carriers =
+        Vec::with_capacity(params.segments * number_of_data_carriers);
+    intra_segment_interleaved_layer_carriers
+        .resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+    let mut randomized_layer_carriers =
+        Vec::with_capacity(params.segments * number_of_data_carriers);
+    randomized_layer_carriers.resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+    let mut frame_begin_time = Instant::now();
+
+    let p = params.clone();
+    let (tsp_sender, tsp_receiver) = std::sync::mpsc::sync_channel(65536);
+    std::thread::spawn(move || {
+        tsp_worker(
+            Parameters {
+                mode,
+                guard_interval_ratio,
+            },
+            p,
+            tsp_sender,
+        )
+    });
+    let (symbol_sender, symbol_receiver) = std::sync::mpsc::sync_channel(65536);
+    let p = params.clone();
+    std::thread::spawn(move || {
+        tsp_to_symbols_worker(
+            Parameters {
+                mode,
+                guard_interval_ratio,
+            },
+            p,
+            tsp_receiver,
+            symbol_sender,
+        )
+    });
+    while let Ok(carriers) = symbol_receiver.recv() {
+        for c in carriers {
+            layer_carriers.push(c);
+            if layer_carriers.len() == number_of_data_carriers * params.segments {
+                for segment in 0..params.segments {
                     let time_interleaver = &mut time_interleavers[segment];
                     for i in 0..number_of_data_carriers {
                         time_interleaved_layer_carriers[segment * number_of_data_carriers + i] =
@@ -560,14 +655,14 @@ fn main() -> io::Result<()> {
                                 .push(layer_carriers[segment * number_of_data_carriers + i], i);
                     }
                 }
-                for segment in 0..segments {
+                for segment in 0..params.segments {
                     for i in 0..number_of_data_carriers {
                         inter_segment_interleaved_layer_carriers
                             [segment * number_of_data_carriers + i] =
-                            time_interleaved_layer_carriers[segment + i * segments];
+                            time_interleaved_layer_carriers[segment + i * params.segments];
                     }
                 }
-                for segment in 0..segments {
+                for segment in 0..params.segments {
                     let dest_segment = &mut intra_segment_interleaved_layer_carriers[segment
                         * number_of_data_carriers
                         ..(segment + 1) * number_of_data_carriers];
@@ -578,7 +673,7 @@ fn main() -> io::Result<()> {
                         dest_segment[i] = source_segment[(i + segment) % number_of_data_carriers];
                     }
                 }
-                for segment in 0..segments {
+                for segment in 0..params.segments {
                     for i in 0..number_of_data_carriers {
                         randomized_layer_carriers
                             [MODE3_CARRIER_RANDOMIZE[i] + number_of_data_carriers * segment] =
@@ -586,12 +681,12 @@ fn main() -> io::Result<()> {
                                 [i + number_of_data_carriers * segment];
                     }
                 }
-                let mut carriers = Vec::with_capacity(8192);
-                carriers.resize(8192, Complex32::ZERO);
+                let mut carriers = Vec::with_capacity(symbol_len);
+                carriers.resize(symbol_len, Complex32::ZERO);
                 let seg_off = symbol_len / 2 - number_of_carriers / 2 - 6 * number_of_carriers;
                 let segment_offsets = [6, 5, 7, 4, 8, 3, 9, 2, 10, 1, 11, 0, 12];
                 let mut data_index = 0;
-                for segment in 0..segments {
+                for segment in 0..params.segments {
                     let tmcc_carriers = TMCC_CARRIER[segment_offsets[segment]];
                     let ac_carriers = AC_CARRIER[segment_offsets[segment]];
                     let segment_carrier_index = number_of_carriers * segment_offsets[segment];
@@ -670,13 +765,9 @@ fn main() -> io::Result<()> {
                         // buf.extend_from_slice(&c.re.to_le_bytes());
                         // buf.extend_from_slice(&c.im.to_le_bytes());
                     }
-                    output.write(&buf)?;
+                    output.write_all(&buf)?;
                 }
                 ofdm_symbol_index += 1;
-                if ofdm_symbol_index == OFDM_FRAME_SYMBOLS - 2 {
-                    prbs_state = BYTE_PRBS_INITIAL_STATE;
-                    puncture_state = 0;
-                }
                 if ofdm_symbol_index == OFDM_FRAME_SYMBOLS {
                     ofdm_symbol_index = 0;
                     eprintln!(
@@ -689,14 +780,8 @@ fn main() -> io::Result<()> {
                 layer_carriers.clear();
             }
         }
-        if !chunks.remainder().is_empty() {
-            let remainder = chunks.remainder().to_vec();
-            bit_buf.clear();
-            bit_buf.extend_from_slice(&remainder);
-        } else {
-            bit_buf.clear();
-        }
     }
+    return Ok(());
 }
 
 #[allow(unused)]
@@ -728,6 +813,16 @@ enum CarrierModulation {
     QPSK,
     QAM16,
     QAM64,
+}
+
+impl CarrierModulation {
+    fn get_bits(&self) -> usize {
+        return match self {
+            CarrierModulation::DQPSK | CarrierModulation::QPSK => 2,
+            CarrierModulation::QAM16 => 4,
+            CarrierModulation::QAM64 => 6,
+        };
+    }
 }
 
 #[allow(unused)]
@@ -811,7 +906,7 @@ impl From<CodingRate> for TMCCCodingRate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LayerParameter {
+struct TMCCLayerParameters {
     carrier_modulation: TMCCCarrierModulation,
     coding_rate: TMCCCodingRate,
     time_interleaving_length: u8,
@@ -819,14 +914,14 @@ struct LayerParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TransmissionParameter {
+struct TMCCTransmissionParameters {
     partial_reception: bool,
-    layer_a: LayerParameter,
-    layer_b: LayerParameter,
-    layer_c: LayerParameter,
+    layer_a: TMCCLayerParameters,
+    layer_b: TMCCLayerParameters,
+    layer_c: TMCCLayerParameters,
 }
 
-impl TransmissionParameter {
+impl TMCCTransmissionParameters {
     fn to_bytes(&self) -> [u8; 5] {
         let mut buf = [0u8; 5];
         let mut pos = 0;
@@ -882,8 +977,8 @@ struct TMCC {
     system_idenfication: SystemIdentification,
     switcihg_indicator: u8,
     startup_control: bool,
-    current: TransmissionParameter,
-    next: TransmissionParameter,
+    current: TMCCTransmissionParameters,
+    next: TMCCTransmissionParameters,
 }
 
 impl TMCC {
