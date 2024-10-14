@@ -288,11 +288,11 @@ struct LayerParameters {
 fn tsp_worker(
     trans_params: Parameters,
     params: LayerParameters,
+    receiver: std::sync::mpsc::Receiver<Vec<u8>>,
     sender: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) {
     let mod_bits = params.modulation.get_bits();
     let mode = trans_params.mode;
-    let mut stdin = std::io::stdin();
     let rs_encoder = Encoder::new(TS_PARITY_SIZE);
     let tsp_per_frame =
         12 * mod_bits * (1 << (mode as usize - 1)) * params.segments * params.coding_rate.numer()
@@ -306,13 +306,11 @@ fn tsp_worker(
         tsp.push(TS_SYNC_BYTE);
         tsp_delay.push_back(tsp);
     }
-    let mut packet = [0u8; TS_SIZE];
     let mut byte_interleaver = ByteInterleaver::new();
     let mut prbs_state = BYTE_PRBS_INITIAL_STATE;
     let mut tsp_count = 0;
-    loop {
-        stdin.read_exact(&mut packet).unwrap();
-        let encoded_packet = rs_encoder.encode(&packet);
+    while let Ok(packet) = receiver.recv() {
+        let encoded_packet = rs_encoder.encode(&packet[0..TS_SIZE]);
         let mut tsp = Vec::with_capacity(TSP_SIZE);
         tsp.extend_from_slice(&encoded_packet[1..]);
         for b in &mut tsp {
@@ -339,7 +337,8 @@ fn tsp_to_symbols_worker(
     trans_params: Parameters,
     params: LayerParameters,
     recv: std::sync::mpsc::Receiver<Vec<u8>>,
-    sender: std::sync::mpsc::SyncSender<Vec<Complex32>>,
+    sender: std::sync::mpsc::SyncSender<(Layer, Vec<Complex32>)>,
+    layer: Layer,
 ) {
     let mode = trans_params.mode;
     let qpsk_mapping = [
@@ -482,7 +481,7 @@ fn tsp_to_symbols_worker(
             layer_carriers.push(symbol);
         }
         let size = layer_carriers.len();
-        sender.send(layer_carriers).unwrap();
+        sender.send((layer, layer_carriers)).unwrap();
         layer_carriers = Vec::with_capacity(size);
         if !chunks.remainder().is_empty() {
             let remainder = chunks.remainder().to_vec();
@@ -502,10 +501,10 @@ enum Layer {
 }
 
 fn simulate_model_receiver(
-    params: Parameters,
-    layer_a: LayerParameters,
-    layer_b: LayerParameters,
-    layer_c: LayerParameters,
+    params: &Parameters,
+    layer_a: &LayerParameters,
+    layer_b: &LayerParameters,
+    layer_c: &LayerParameters,
 ) -> Vec<Option<Layer>> {
     let number_of_data_carriers = 96 * (1 << (params.mode as usize - 1));
     let symbol_len = 2048 * (1 << (params.mode as usize - 1));
@@ -617,38 +616,60 @@ fn simulate_model_receiver(
     return ts_pattern;
 }
 
+fn ts_worker(
+    params: &Parameters,
+    layer_a_params: &LayerParameters,
+    layer_a_ts_sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+    layer_b_params: &LayerParameters,
+    layer_b_ts_sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+    layer_c_params: &LayerParameters,
+    layer_c_ts_sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+) {
+    let frame_pattern =
+        simulate_model_receiver(&params, &layer_a_params, &layer_b_params, &layer_c_params);
+    let mut stdin = std::io::stdin();
+    let mut frame_buffer = Vec::with_capacity(frame_pattern.len() * TS_SIZE);
+    frame_buffer.resize(frame_pattern.len() * TS_SIZE, 0);
+    loop {
+        stdin.read_exact(&mut frame_buffer).unwrap();
+        for (i, l) in frame_pattern.iter().enumerate() {
+            if let Some(l) = l {
+                let packet = frame_buffer[i * TS_SIZE..(i + 1) * TS_SIZE].to_vec();
+                match l {
+                    Layer::A => layer_a_ts_sender.send(packet).unwrap(),
+                    Layer::B => layer_b_ts_sender.send(packet).unwrap(),
+                    Layer::C => layer_c_ts_sender.send(packet).unwrap(),
+                }
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
-    let _ = simulate_model_receiver(
-        Parameters {
-            mode: Mode::Mode3,
-            guard_interval_ratio: 8,
-        },
-        LayerParameters {
-            modulation: CarrierModulation::QPSK,
-            segments: 1,
-            coding_rate: CodingRate::Rate2_3,
-            time_interleave_length: 4,
-        },
-        LayerParameters {
-            modulation: CarrierModulation::QAM64,
-            segments: 12,
-            coding_rate: CodingRate::Rate3_4,
-            time_interleave_length: 2,
-        },
-        LayerParameters {
-            modulation: CarrierModulation::QAM64,
-            segments: 0,
-            coding_rate: CodingRate::Rate7_8,
-            time_interleave_length: 4,
-        },
-    );
+    let layer_a_params = LayerParameters {
+        modulation: CarrierModulation::QPSK,
+        segments: 1,
+        coding_rate: CodingRate::Rate2_3,
+        time_interleave_length: 4,
+    };
+    let layer_b_params = LayerParameters {
+        modulation: CarrierModulation::QAM64,
+        segments: 12,
+        coding_rate: CodingRate::Rate3_4,
+        time_interleave_length: 2,
+    };
+    let layer_c_params = LayerParameters {
+        modulation: CarrierModulation::QAM64,
+        segments: 0,
+        coding_rate: CodingRate::Rate7_8,
+        time_interleave_length: 4,
+    };
+    let partial_reception = true;
     let mode = Mode::Mode3;
     let guard_interval_ratio = 8;
-    let params = LayerParameters {
-        modulation: CarrierModulation::QAM64,
-        segments: SEGMENTS,
-        coding_rate: CodingRate::Rate3_4,
-        time_interleave_length: 4,
+    let params = Parameters {
+        mode,
+        guard_interval_ratio,
     };
     let tmcc = TMCC {
         segment_type: SegmentType::Coherent,
@@ -656,46 +677,16 @@ fn main() -> io::Result<()> {
         switcihg_indicator: 0b1111,
         startup_control: false,
         current: TMCCTransmissionParameters {
-            partial_reception: false,
-            layer_a: TMCCLayerParameters {
-                carrier_modulation: TMCCCarrierModulation::from(params.modulation),
-                coding_rate: TMCCCodingRate::from(params.coding_rate),
-                number_of_segments: params.segments as u8,
-                time_interleaving_length: 0b11,
-            },
-            layer_b: TMCCLayerParameters {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
-            layer_c: TMCCLayerParameters {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
+            partial_reception,
+            layer_a: TMCCLayerParameters::from(&layer_a_params, params.mode),
+            layer_b: TMCCLayerParameters::from(&layer_b_params, params.mode),
+            layer_c: TMCCLayerParameters::from(&layer_c_params, params.mode),
         },
         next: TMCCTransmissionParameters {
-            partial_reception: false,
-            layer_a: TMCCLayerParameters {
-                carrier_modulation: TMCCCarrierModulation::from(params.modulation),
-                coding_rate: TMCCCodingRate::from(params.coding_rate),
-                number_of_segments: params.segments as u8,
-                time_interleaving_length: 0b11,
-            },
-            layer_b: TMCCLayerParameters {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
-            layer_c: TMCCLayerParameters {
-                carrier_modulation: TMCCCarrierModulation::Unused,
-                coding_rate: TMCCCodingRate::Unused,
-                number_of_segments: 0b1111,
-                time_interleaving_length: 0b111,
-            },
+            partial_reception,
+            layer_a: TMCCLayerParameters::from(&layer_a_params, params.mode),
+            layer_b: TMCCLayerParameters::from(&layer_b_params, params.mode),
+            layer_c: TMCCLayerParameters::from(&layer_c_params, params.mode),
         },
     };
     let args: Vec<_> = std::env::args().collect();
@@ -715,17 +706,28 @@ fn main() -> io::Result<()> {
     let number_of_carriers = 108 * (1 << (mode as usize - 1));
     let symbol_len = 2048 * (1 << (mode as usize - 1));
     let guard_interval_len = symbol_len / guard_interval_ratio;
-    let mut time_interleavers = Vec::with_capacity(params.segments);
-    time_interleavers.resize_with(params.segments, || {
+    let mut time_interleavers_layer_a = Vec::with_capacity(layer_a_params.segments);
+    time_interleavers_layer_a.resize_with(layer_a_params.segments, || {
         TimeInterleaver::new(
-            params.time_interleave_length,
+            layer_a_params.time_interleave_length,
             number_of_data_carriers,
-            match mode {
-                Mode::Mode1 | Mode::Mode2 => 7 * params.time_interleave_length,
-                Mode::Mode3 => {
-                    OFDM_FRAME_SYMBOLS - (95 * params.time_interleave_length) % OFDM_FRAME_SYMBOLS
-                }
-            },
+            OFDM_FRAME_SYMBOLS - (95 * layer_a_params.time_interleave_length) % OFDM_FRAME_SYMBOLS,
+        )
+    });
+    let mut time_interleavers_layer_b = Vec::with_capacity(layer_b_params.segments);
+    time_interleavers_layer_b.resize_with(layer_b_params.segments, || {
+        TimeInterleaver::new(
+            layer_b_params.time_interleave_length,
+            number_of_data_carriers,
+            OFDM_FRAME_SYMBOLS - (95 * layer_b_params.time_interleave_length) % OFDM_FRAME_SYMBOLS,
+        )
+    });
+    let mut time_interleavers_layer_c = Vec::with_capacity(layer_c_params.segments);
+    time_interleavers_layer_c.resize_with(layer_c_params.segments, || {
+        TimeInterleaver::new(
+            layer_c_params.time_interleave_length,
+            number_of_data_carriers,
+            OFDM_FRAME_SYMBOLS - (95 * layer_c_params.time_interleave_length) % OFDM_FRAME_SYMBOLS,
         )
     });
     let mut ofdm_symbol_index = OFDM_FRAME_SYMBOLS - 2;
@@ -747,26 +749,80 @@ fn main() -> io::Result<()> {
         prbs_table.push((pilot_prbs_state & 1) == 1);
         pilot_prbs_state = pilot_prbs(pilot_prbs_state);
     }
-    let mut layer_carriers = Vec::new();
-    let mut time_interleaved_layer_carriers =
-        Vec::with_capacity(params.segments * number_of_data_carriers);
-    time_interleaved_layer_carriers
-        .resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+    let coherent_modulation_segments = if !partial_reception {
+        layer_a_params.segments
+    } else {
+        0
+    } + layer_b_params.segments
+        + layer_c_params.segments;
+    let partial_reception_segments = if partial_reception { 1 } else { 0 };
+    let mut time_interleaved_partial_reception_carriers =
+        Vec::with_capacity(partial_reception_segments * number_of_data_carriers);
+    time_interleaved_partial_reception_carriers.resize(
+        partial_reception_segments * number_of_data_carriers,
+        Complex32::ZERO,
+    );
+    let mut time_interleaved_coherent_carriers =
+        Vec::with_capacity(coherent_modulation_segments * number_of_data_carriers);
+    time_interleaved_coherent_carriers.resize(
+        coherent_modulation_segments * number_of_data_carriers,
+        Complex32::ZERO,
+    );
     let mut inter_segment_interleaved_layer_carriers =
-        Vec::with_capacity(params.segments * number_of_data_carriers);
-    inter_segment_interleaved_layer_carriers
-        .resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+        Vec::with_capacity(coherent_modulation_segments * number_of_data_carriers);
+    inter_segment_interleaved_layer_carriers.resize(
+        coherent_modulation_segments * number_of_data_carriers,
+        Complex32::ZERO,
+    );
     let mut intra_segment_interleaved_layer_carriers =
-        Vec::with_capacity(params.segments * number_of_data_carriers);
-    intra_segment_interleaved_layer_carriers
-        .resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+        Vec::with_capacity(coherent_modulation_segments * number_of_data_carriers);
+    intra_segment_interleaved_layer_carriers.resize(
+        coherent_modulation_segments * number_of_data_carriers,
+        Complex32::ZERO,
+    );
     let mut randomized_layer_carriers =
-        Vec::with_capacity(params.segments * number_of_data_carriers);
-    randomized_layer_carriers.resize(params.segments * number_of_data_carriers, Complex32::ZERO);
+        Vec::with_capacity(coherent_modulation_segments * number_of_data_carriers);
+    randomized_layer_carriers.resize(
+        coherent_modulation_segments * number_of_data_carriers,
+        Complex32::ZERO,
+    );
+    let mut randomized_partial_reception_carriers =
+        Vec::with_capacity(partial_reception_segments * number_of_data_carriers);
+    randomized_partial_reception_carriers.resize(
+        partial_reception_segments * number_of_data_carriers,
+        Complex32::ZERO,
+    );
+    let carrier_randomize = match mode {
+        Mode::Mode1 => &MODE1_CARRIER_RANDOMIZE[..],
+        Mode::Mode2 => &MODE2_CARRIER_RANDOMIZE[..],
+        Mode::Mode3 => &MODE3_CARRIER_RANDOMIZE[..],
+    };
     let mut frame_begin_time = Instant::now();
-
+    let (layer_a_ts_sender, layer_a_ts_receiver) = std::sync::mpsc::sync_channel(65536);
+    let (layer_b_ts_sender, layer_b_ts_receiver) = std::sync::mpsc::sync_channel(65536);
+    let (layer_c_ts_sender, layer_c_ts_receiver) = std::sync::mpsc::sync_channel(65536);
     let p = params.clone();
-    let (tsp_sender, tsp_receiver) = std::sync::mpsc::sync_channel(65536);
+    let p1 = layer_a_params.clone();
+    let p2 = layer_b_params.clone();
+    let p3 = layer_c_params.clone();
+    std::thread::spawn(move || {
+        ts_worker(
+            &p,
+            &p1,
+            layer_a_ts_sender,
+            &p2,
+            layer_b_ts_sender,
+            &p3,
+            layer_c_ts_sender,
+        );
+    });
+    let (layer_a_interleaved_tsp_sender, layer_a_interleaved_tsp_receiver) =
+        std::sync::mpsc::sync_channel(65536);
+    let (layer_b_interleaved_tsp_sender, layer_b_interleaved_tsp_receiver) =
+        std::sync::mpsc::sync_channel(65536);
+    let (layer_c_interleaved_tsp_sender, layer_c_interleaved_tsp_receiver) =
+        std::sync::mpsc::sync_channel(65536);
+    let p = layer_a_params.clone();
     std::thread::spawn(move || {
         tsp_worker(
             Parameters {
@@ -774,11 +830,42 @@ fn main() -> io::Result<()> {
                 guard_interval_ratio,
             },
             p,
-            tsp_sender,
+            layer_a_ts_receiver,
+            layer_a_interleaved_tsp_sender,
         )
     });
-    let (symbol_sender, symbol_receiver) = std::sync::mpsc::sync_channel(65536);
-    let p = params.clone();
+    if layer_b_params.segments > 0 {
+        let p = layer_b_params.clone();
+        std::thread::spawn(move || {
+            tsp_worker(
+                Parameters {
+                    mode,
+                    guard_interval_ratio,
+                },
+                p,
+                layer_b_ts_receiver,
+                layer_b_interleaved_tsp_sender,
+            )
+        });
+    }
+    if layer_c_params.segments > 0 {
+        let p = layer_c_params.clone();
+        std::thread::spawn(move || {
+            tsp_worker(
+                Parameters {
+                    mode,
+                    guard_interval_ratio,
+                },
+                p,
+                layer_c_ts_receiver,
+                layer_c_interleaved_tsp_sender,
+            )
+        });
+    }
+    let (layer_a_symbol_sender, symbol_receiver) = std::sync::mpsc::sync_channel(65536);
+    let layer_b_symbol_sender = layer_a_symbol_sender.clone();
+    let layer_c_symbol_sender = layer_a_symbol_sender.clone();
+    let p = layer_a_params.clone();
     std::thread::spawn(move || {
         tsp_to_symbols_worker(
             Parameters {
@@ -786,145 +873,226 @@ fn main() -> io::Result<()> {
                 guard_interval_ratio,
             },
             p,
-            tsp_receiver,
-            symbol_sender,
+            layer_a_interleaved_tsp_receiver,
+            layer_a_symbol_sender,
+            Layer::A,
         )
     });
-    while let Ok(carriers) = symbol_receiver.recv() {
-        for c in carriers {
-            layer_carriers.push(c);
-            if layer_carriers.len() == number_of_data_carriers * params.segments {
-                for segment in 0..params.segments {
-                    let time_interleaver = &mut time_interleavers[segment];
-                    for i in 0..number_of_data_carriers {
-                        time_interleaved_layer_carriers[segment * number_of_data_carriers + i] =
-                            time_interleaver
-                                .push(layer_carriers[segment * number_of_data_carriers + i], i);
-                    }
+    if layer_b_params.segments > 0 {
+        let p = layer_b_params.clone();
+        std::thread::spawn(move || {
+            tsp_to_symbols_worker(
+                Parameters {
+                    mode,
+                    guard_interval_ratio,
+                },
+                p,
+                layer_b_interleaved_tsp_receiver,
+                layer_b_symbol_sender,
+                Layer::B,
+            )
+        });
+    }
+    if layer_c_params.segments > 0 {
+        let p = layer_c_params.clone();
+        std::thread::spawn(move || {
+            tsp_to_symbols_worker(
+                Parameters {
+                    mode,
+                    guard_interval_ratio,
+                },
+                p,
+                layer_c_interleaved_tsp_receiver,
+                layer_c_symbol_sender,
+                Layer::C,
+            )
+        });
+    }
+    let mut layer_a_symbol_buffer = VecDeque::new();
+    let mut layer_b_symbol_buffer = VecDeque::new();
+    let mut layer_c_symbol_buffer = VecDeque::new();
+    let mut planner = FftPlanner::<f32>::new();
+    let ifft = planner.plan_fft_inverse(symbol_len);
+    loop {
+        if let Ok((layer, carriers)) = symbol_receiver.recv() {
+            match layer {
+                Layer::A => {
+                    layer_a_symbol_buffer.extend(carriers);
                 }
-                for segment in 0..params.segments {
-                    for i in 0..number_of_data_carriers {
-                        inter_segment_interleaved_layer_carriers
+                Layer::B => {
+                    layer_b_symbol_buffer.extend(carriers);
+                }
+                Layer::C => {
+                    layer_c_symbol_buffer.extend(carriers);
+                }
+            }
+        } else {
+            break;
+        }
+        if layer_a_symbol_buffer.len() >= number_of_data_carriers * layer_a_params.segments
+            && layer_b_symbol_buffer.len() >= number_of_data_carriers * layer_b_params.segments
+            && layer_c_symbol_buffer.len() >= number_of_data_carriers * layer_c_params.segments
+        {
+            for segment in 0..layer_a_params.segments {
+                let time_interleaver = &mut time_interleavers_layer_a[segment];
+                for i in 0..number_of_data_carriers {
+                    if partial_reception {
+                        time_interleaved_partial_reception_carriers
                             [segment * number_of_data_carriers + i] =
-                            time_interleaved_layer_carriers[segment + i * params.segments];
+                            time_interleaver.push(layer_a_symbol_buffer.pop_front().unwrap(), i);
+                    } else {
+                        time_interleaved_coherent_carriers[segment * number_of_data_carriers + i] =
+                            time_interleaver.push(layer_a_symbol_buffer.pop_front().unwrap(), i);
                     }
                 }
-                for segment in 0..params.segments {
-                    let dest_segment = &mut intra_segment_interleaved_layer_carriers[segment
-                        * number_of_data_carriers
-                        ..(segment + 1) * number_of_data_carriers];
-                    let source_segment = &inter_segment_interleaved_layer_carriers[segment
-                        * number_of_data_carriers
-                        ..(segment + 1) * number_of_data_carriers];
-                    for i in 0..number_of_data_carriers {
-                        dest_segment[i] = source_segment[(i + segment) % number_of_data_carriers];
-                    }
+            }
+            let offset = if !partial_reception {
+                layer_a_params.segments * number_of_data_carriers
+            } else {
+                0
+            };
+            for segment in 0..layer_b_params.segments {
+                let time_interleaver = &mut time_interleavers_layer_b[segment];
+                for i in 0..number_of_data_carriers {
+                    time_interleaved_coherent_carriers
+                        [offset + segment * number_of_data_carriers + i] =
+                        time_interleaver.push(layer_b_symbol_buffer.pop_front().unwrap(), i);
                 }
-                for segment in 0..params.segments {
-                    for i in 0..number_of_data_carriers {
-                        randomized_layer_carriers
-                            [MODE3_CARRIER_RANDOMIZE[i] + number_of_data_carriers * segment] =
-                            intra_segment_interleaved_layer_carriers
-                                [i + number_of_data_carriers * segment];
-                    }
+            }
+            let offset = offset + layer_b_params.segments * number_of_data_carriers;
+            for segment in 0..layer_c_params.segments {
+                let time_interleaver = &mut time_interleavers_layer_c[segment];
+                for i in 0..number_of_data_carriers {
+                    time_interleaved_coherent_carriers
+                        [offset + segment * number_of_data_carriers + i] =
+                        time_interleaver.push(layer_c_symbol_buffer.pop_front().unwrap(), i);
                 }
-                let mut carriers = Vec::with_capacity(symbol_len);
-                carriers.resize(symbol_len, Complex32::ZERO);
-                let seg_off = symbol_len / 2 - number_of_carriers / 2 - 6 * number_of_carriers;
-                let segment_offsets = [6, 5, 7, 4, 8, 3, 9, 2, 10, 1, 11, 0, 12];
-                let mut data_index = 0;
-                for segment in 0..params.segments {
-                    let tmcc_carriers = TMCC_CARRIER[segment_offsets[segment]];
-                    let ac_carriers = AC_CARRIER[segment_offsets[segment]];
-                    let segment_carrier_index = number_of_carriers * segment_offsets[segment];
-                    let segment_carries = &mut carriers[seg_off + segment_carrier_index
-                        ..seg_off + segment_carrier_index + number_of_carriers];
-                    for i in 0..number_of_carriers {
-                        if i % 12 == ofdm_symbol_index % 4 * 3 {
-                            match prbs_table[segment_carrier_index + i] {
-                                true => {
-                                    segment_carries[i] = Complex32::new(-4f32 / 3f32, 0f32);
-                                }
-                                false => {
-                                    segment_carries[i] = Complex32::new(4f32 / 3f32, 0f32);
-                                }
+            }
+            for segment in 0..coherent_modulation_segments {
+                for i in 0..number_of_data_carriers {
+                    inter_segment_interleaved_layer_carriers
+                        [segment * number_of_data_carriers + i] =
+                        time_interleaved_coherent_carriers
+                            [segment + i * coherent_modulation_segments];
+                }
+            }
+            for segment in 0..coherent_modulation_segments {
+                let dest_segment = &mut intra_segment_interleaved_layer_carriers
+                    [segment * number_of_data_carriers..(segment + 1) * number_of_data_carriers];
+                let source_segment = &inter_segment_interleaved_layer_carriers
+                    [segment * number_of_data_carriers..(segment + 1) * number_of_data_carriers];
+                for i in 0..number_of_data_carriers {
+                    dest_segment[i] = source_segment
+                        [(i + segment + partial_reception_segments) % number_of_data_carriers];
+                }
+            }
+            for segment in 0..coherent_modulation_segments {
+                for i in 0..number_of_data_carriers {
+                    randomized_layer_carriers
+                        [carrier_randomize[i] + number_of_data_carriers * segment] =
+                        intra_segment_interleaved_layer_carriers
+                            [i + number_of_data_carriers * segment];
+                }
+            }
+            for segment in 0..partial_reception_segments {
+                for i in 0..number_of_data_carriers {
+                    randomized_partial_reception_carriers
+                        [carrier_randomize[i] + number_of_data_carriers * segment] =
+                        time_interleaved_partial_reception_carriers
+                            [i + number_of_data_carriers * segment];
+                }
+            }
+            let mut carriers = Vec::with_capacity(symbol_len);
+            carriers.resize(symbol_len, Complex32::ZERO);
+            let seg_off = symbol_len / 2 - number_of_carriers / 2 - 6 * number_of_carriers;
+            let segment_offsets = [6, 5, 7, 4, 8, 3, 9, 2, 10, 1, 11, 0, 12];
+            let mut data_index = 0;
+            for segment in 0..partial_reception_segments + coherent_modulation_segments {
+                let tmcc_carriers = TMCC_CARRIER[segment_offsets[segment]];
+                let ac_carriers = AC_CARRIER[segment_offsets[segment]];
+                let segment_carrier_index = number_of_carriers * segment_offsets[segment];
+                let segment_carries = &mut carriers[seg_off + segment_carrier_index
+                    ..seg_off + segment_carrier_index + number_of_carriers];
+                for i in 0..number_of_carriers {
+                    if i % 12 == ofdm_symbol_index % 4 * 3 {
+                        match prbs_table[segment_carrier_index + i] {
+                            true => {
+                                segment_carries[i] = Complex32::new(-4f32 / 3f32, 0f32);
                             }
-                        } else if tmcc_carriers.contains(&i) {
-                            match if ofdm_frame_index % 2 == 0 {
-                                encoded_tmcc_even[ofdm_symbol_index]
-                            } else {
-                                encoded_tmcc_odd[ofdm_symbol_index]
-                            } ^ prbs_table[segment_carrier_index + i]
-                            {
-                                true => {
-                                    segment_carries[i] = Complex32::new(-4f32 / 3f32, 0f32);
-                                }
-                                false => {
-                                    segment_carries[i] = Complex32::new(4f32 / 3f32, 0f32);
-                                }
+                            false => {
+                                segment_carries[i] = Complex32::new(4f32 / 3f32, 0f32);
                             }
-                        } else if ac_carriers.contains(&i) {
-                            match encoded_ac[ofdm_symbol_index]
-                                ^ prbs_table[segment_carrier_index + i]
-                            {
-                                true => {
-                                    segment_carries[i] = Complex32::new(-4f32 / 3f32, 0f32);
-                                }
-                                false => {
-                                    segment_carries[i] = Complex32::new(4f32 / 3f32, 0f32);
-                                }
-                            }
-                        } else {
-                            segment_carries[i] = randomized_layer_carriers[data_index];
-                            data_index += 1;
                         }
+                    } else if tmcc_carriers.contains(&i) {
+                        match if ofdm_frame_index % 2 == 0 {
+                            encoded_tmcc_even[ofdm_symbol_index]
+                        } else {
+                            encoded_tmcc_odd[ofdm_symbol_index]
+                        } ^ prbs_table[segment_carrier_index + i]
+                        {
+                            true => {
+                                segment_carries[i] = Complex32::new(-4f32 / 3f32, 0f32);
+                            }
+                            false => {
+                                segment_carries[i] = Complex32::new(4f32 / 3f32, 0f32);
+                            }
+                        }
+                    } else if ac_carriers.contains(&i) {
+                        match encoded_ac[ofdm_symbol_index] ^ prbs_table[segment_carrier_index + i]
+                        {
+                            true => {
+                                segment_carries[i] = Complex32::new(-4f32 / 3f32, 0f32);
+                            }
+                            false => {
+                                segment_carries[i] = Complex32::new(4f32 / 3f32, 0f32);
+                            }
+                        }
+                    } else {
+                        if segment < partial_reception_segments {
+                            segment_carries[i] = randomized_partial_reception_carriers[data_index];
+                        } else {
+                            segment_carries[i] = randomized_layer_carriers
+                                [data_index - partial_reception_segments * number_of_data_carriers];
+                        }
+                        data_index += 1;
                     }
                 }
-                assert_eq!(data_index, randomized_layer_carriers.len());
-                carriers[seg_off + number_of_carriers * SEGMENTS] =
-                    match (prbs_table[number_of_carriers * SEGMENTS], mode) {
-                        (true, Mode::Mode1) => Complex32::new(-4f32 / 3f32, 0f32),
-                        (false, Mode::Mode2 | Mode::Mode3) => Complex32::new(4f32 / 3f32, 0f32),
-                        _ => panic!(),
-                    };
-                let (negative_freq, positive_freq) = carriers.split_at_mut(symbol_len / 2);
-                positive_freq.swap_with_slice(negative_freq);
-                let mut planner = FftPlanner::<f32>::new();
-                let ifft = planner.plan_fft_inverse(symbol_len);
-                ifft.process(&mut carriers);
-                let guard_interval = &carriers[carriers.len() - guard_interval_len..];
-                if ofdm_frame_index > 2 {
-                    let mut buf = Vec::new();
-                    let scale = 1f32;
-                    for c in guard_interval {
-                        let s = (c.re * scale) as i32;
-                        buf.extend_from_slice(&(s as u16).to_le_bytes());
-                        let s = (c.im * scale) as i32;
-                        buf.extend_from_slice(&(s as u16).to_le_bytes());
-                        // buf.extend_from_slice(&c.re.to_le_bytes());
-                        // buf.extend_from_slice(&c.im.to_le_bytes());
-                    }
-                    for c in &carriers {
-                        let s = (c.re * scale) as i32;
-                        buf.extend_from_slice(&(s as u16).to_le_bytes());
-                        let s = (c.im * scale) as i32;
-                        buf.extend_from_slice(&(s as u16).to_le_bytes());
-                        // buf.extend_from_slice(&c.re.to_le_bytes());
-                        // buf.extend_from_slice(&c.im.to_le_bytes());
-                    }
-                    output.write_all(&buf)?;
+            }
+            assert_eq!(
+                data_index,
+                randomized_partial_reception_carriers.len() + randomized_layer_carriers.len()
+            );
+            carriers[seg_off + number_of_carriers * SEGMENTS] =
+                match (prbs_table[number_of_carriers * SEGMENTS], mode) {
+                    (true, Mode::Mode1) => Complex32::new(-4f32 / 3f32, 0f32),
+                    (false, Mode::Mode2 | Mode::Mode3) => Complex32::new(4f32 / 3f32, 0f32),
+                    _ => panic!(),
+                };
+            let (negative_freq, positive_freq) = carriers.split_at_mut(symbol_len / 2);
+            positive_freq.swap_with_slice(negative_freq);
+            ifft.process(&mut carriers);
+            let guard_interval = &carriers[carriers.len() - guard_interval_len..];
+            if ofdm_frame_index > 2 {
+                let mut buf = Vec::new();
+                for c in guard_interval {
+                    buf.extend_from_slice(&c.re.to_le_bytes());
+                    buf.extend_from_slice(&c.im.to_le_bytes());
                 }
-                ofdm_symbol_index += 1;
-                if ofdm_symbol_index == OFDM_FRAME_SYMBOLS {
-                    ofdm_symbol_index = 0;
-                    eprintln!(
-                        "{ofdm_frame_index} {:.03}",
-                        (Instant::now() - frame_begin_time).as_secs_f32()
-                    );
-                    frame_begin_time = Instant::now();
-                    ofdm_frame_index += 1;
+                for c in &carriers {
+                    buf.extend_from_slice(&c.re.to_le_bytes());
+                    buf.extend_from_slice(&c.im.to_le_bytes());
                 }
-                layer_carriers.clear();
+                output.write_all(&buf)?;
+            }
+            ofdm_symbol_index += 1;
+            if ofdm_symbol_index == OFDM_FRAME_SYMBOLS {
+                ofdm_symbol_index = 0;
+                eprintln!(
+                    "{ofdm_frame_index} {:.03}",
+                    (Instant::now() - frame_begin_time).as_secs_f32()
+                );
+                frame_begin_time = Instant::now();
+                ofdm_frame_index += 1;
             }
         }
     }
@@ -1058,6 +1226,37 @@ struct TMCCLayerParameters {
     coding_rate: TMCCCodingRate,
     time_interleaving_length: u8,
     number_of_segments: u8,
+}
+
+impl TMCCLayerParameters {
+    fn from(value: &LayerParameters, mode: Mode) -> Self {
+        if value.segments == 0 {
+            return TMCCLayerParameters {
+                carrier_modulation: TMCCCarrierModulation::Unused,
+                coding_rate: TMCCCodingRate::Unused,
+                number_of_segments: 0b1111,
+                time_interleaving_length: 0b111,
+            };
+        }
+        return TMCCLayerParameters {
+            carrier_modulation: TMCCCarrierModulation::from(value.modulation),
+            coding_rate: TMCCCodingRate::from(value.coding_rate),
+            number_of_segments: value.segments as u8,
+            time_interleaving_length: match (value.time_interleave_length, mode) {
+                (0, _) => 0b000,
+                (4, Mode::Mode1) => 0b001,
+                (2, Mode::Mode2) => 0b001,
+                (1, Mode::Mode3) => 0b001,
+                (8, Mode::Mode1) => 0b010,
+                (4, Mode::Mode2) => 0b010,
+                (2, Mode::Mode3) => 0b010,
+                (16, Mode::Mode1) => 0b011,
+                (8, Mode::Mode2) => 0b011,
+                (4, Mode::Mode3) => 0b011,
+                _ => 0b111,
+            },
+        };
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
