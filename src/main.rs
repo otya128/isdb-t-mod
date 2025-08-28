@@ -632,15 +632,51 @@ fn ts_worker(
     frame_buffer.resize(frame_pattern.len() * TS_SIZE, 0);
     loop {
         stdin.read_exact(&mut frame_buffer).unwrap();
-        for (i, l) in frame_pattern.iter().enumerate() {
-            if let Some(l) = l {
-                let packet = frame_buffer[i * TS_SIZE..(i + 1) * TS_SIZE].to_vec();
-                match l {
-                    Layer::A => layer_a_ts_sender.send(packet).unwrap(),
-                    Layer::B => layer_b_ts_sender.send(packet).unwrap(),
-                    Layer::C => layer_c_ts_sender.send(packet).unwrap(),
+        'frame_sync_loop: for frame_sync_pos in 0..frame_pattern.len() {
+            for pos in 0..TS_SIZE {
+                let mut sync = true;
+                for i in 0..8 {
+                    if frame_buffer[pos + i * TS_SIZE] != TS_SYNC_BYTE {
+                        sync = false;
+                        break;
+                    }
+                }
+                if sync && pos != 0 {
+                    eprintln!("TS resync at {pos}");
+                    frame_buffer.drain(0..pos);
+                    let read_pos = frame_buffer.len();
+                    frame_buffer.resize(frame_pattern.len() * TS_SIZE, 0);
+                    stdin.read_exact(&mut frame_buffer[read_pos..]).unwrap();
+                    continue;
                 }
             }
+            assert_eq!(frame_buffer[0], TS_SYNC_BYTE);
+            for (i, l) in frame_pattern.iter().enumerate() {
+                if l.is_none() {
+                    let packet = frame_buffer[i * TS_SIZE..(i + 1) * TS_SIZE].to_vec();
+                    if packet[1] != 0x1f || packet[2] != 0xff {
+                        frame_buffer.drain(0..TS_SIZE);
+                        let read_pos = frame_buffer.len();
+                        frame_buffer.resize(frame_pattern.len() * TS_SIZE, 0);
+                        stdin.read_exact(&mut frame_buffer[read_pos..]).unwrap();
+                        continue 'frame_sync_loop;
+                    }
+                }
+            }
+            if frame_sync_pos != 0 {
+                eprintln!("frame resync at {frame_sync_pos}");
+            }
+            for (i, l) in frame_pattern.iter().enumerate() {
+                if let Some(l) = l {
+                    let packet = frame_buffer[i * TS_SIZE..(i + 1) * TS_SIZE].to_vec();
+                    match l {
+                        Layer::A => layer_a_ts_sender.send(packet).unwrap(),
+                        Layer::B => layer_b_ts_sender.send(packet).unwrap(),
+                        Layer::C => layer_c_ts_sender.send(packet).unwrap(),
+                    }
+                }
+            }
+            break;
         }
     }
 }
